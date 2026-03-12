@@ -10,7 +10,7 @@ autogen-ext==0.7.5
 azure-ai-inference==1.0.0b9
 azure-core==1.38.0
 azure-identity==1.25.0
-certifi==2025.8.3
+certifi==2026.2.25
 cffi==2.0.0
 charset-normalizer==3.4.3
 click==8.3.0
