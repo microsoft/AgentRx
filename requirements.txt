@@ -65,7 +65,7 @@ nvidia-nvtx-cu12==12.8.90
 omegaconf==2.3.0
 openai==1.108.1
 opentelemetry-api==1.38.0
-packaging==25.0
+packaging==26.0
 pandas==2.3.3
 pillow==12.1.1
 propcache==0.4.1
