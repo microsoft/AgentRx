@@ -7,7 +7,7 @@ azure-core>=1.38.0
 azure-identity>=1.25.0
 matplotlib>=3.10.7
 numpy>=2.3.4
-openai>=1.108.1
+openai>=2.32.0
 python-dotenv>=1.1.0
 
 # Required transitive dependencies
