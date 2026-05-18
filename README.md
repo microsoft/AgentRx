@@ -127,6 +127,7 @@ cp .env.example .env
 # Azure OpenAI (default endpoint)
 AGENT_VERIFY_ENDPOINT=                # e.g., "https://my-resource.openai.azure.com/"
 AGENT_VERIFY_DEPLOYMENT=              # e.g., "gpt-5"
+AGENT_VERIFY_MODEL_NAME=              # e.g., "gpt-5" (must match deployment; used by judge)
 
 # TRAPI (Microsoft Research internal, use --endpoint trapi)
 AGENT_VERIFY_TRAPI_INSTANCE=          # e.g., "my-instance/my-pool"
