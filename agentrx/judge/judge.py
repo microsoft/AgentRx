@@ -947,8 +947,12 @@ def get_llm_judge_class():
                                 {"role": "user", "content": user_message},
                             ]
                         )
-                        print("System Prompt:", system_prompt)
-                        print("User Message:", user_message)
+                        if DEBUG_PROMPTS:
+                            try:
+                                print("System Prompt:", system_prompt.encode('ascii', 'replace').decode())
+                                print("User Message:", user_message[:500].encode('ascii', 'replace').decode())
+                            except Exception:
+                                pass
                         completion = self._parse_json_response(response, "Single Pass")
                         break  # Success
                     except Exception as e:
