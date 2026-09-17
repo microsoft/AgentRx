@@ -114,6 +114,141 @@ AgentRx/
 
 ---
 
+## Reproducing the Paper
+
+The paper-default recipe is encoded in `agentrx.pipeline.profiles.PAPER_DEFAULT`
+and is what `run.py` uses when no judge-stage flags are passed:
+
+```
+prompt_mode  = combined            # taxonomy block fed to the judge
+exec_mode    = violations-after    # when category labelling sees violations
+with_context = True                # inject deduplicated violation context
+num_runs     = 3                   # paper reports mean ± std over n=3 runs
+```
+
+```bash
+# Paper-default: produces runs/<name>/judge_output/runs/run{1..3}.json plus
+# an aggregate summary with mean/std for every table cell.
+python run.py trajectory.json
+```
+
+Each axis is overridable on the CLI to reproduce specific ablation cells. The
+flags compose orthogonally; omitted flags inherit from `PAPER_DEFAULT`.
+
+| Flag | Values | Paper cell |
+|------|--------|------------|
+| `--prompt-mode` | `baseline` \| `checklist` \| `examples` \| `combined` | Tables 2, 4 (prompt-mode ablations) |
+| `--exec-mode` | `violations-after` \| `stepbystep` \| `violations-before` | Tables 3, 5 (execution-mode ablations) |
+| `--no-context` | (flag) | "Without violation context" rows |
+| `--num-runs N` | integer ≥ 1 | Set to `1` for fast smoke tests (skips aggregate) |
+| `--dynamic-mode` | `stepbystep` \| `oneshot` | Table 3 (one-shot dynamic invariants) |
+| `--skip-static` | (flag) | Dynamic-only ablation |
+| `--skip-dynamic` | (flag) | Global/static-only ablation |
+| `--prompt-style` | `release` \| `paper` | Selects which judge system-prompt builder is used. `release` is the default shipped here; `paper` mirrors the verbatim taxonomy + section ordering of the camera-ready prompt and is what the paper's table rows were produced with. |
+| `--include-nl-violations` / `--exclude-nl-violations` | (mutually exclusive flags) | Controls whether `nl_check` violations are forwarded into the judge context. `include` is the release default; `exclude` produces the "without NL-check violations" ablation row. |
+
+When `--num-runs > 1`, the wrapper invokes
+`agentrx.judge.judge.create_aggregate_summary` after the loop, which writes
+the mean/std/CV table the paper reports under
+`judge_output/aggregate_summary.json`.
+
+### Reproducibility matrix (paper vs. release)
+
+Two prompt-style profiles are encoded in `agentrx.pipeline.profiles`:
+
+| Profile | `prompt_style` | `include_nl_check_violations` | Use this when... |
+|---------|----------------|-------------------------------|------------------|
+| `PAPER_DEFAULT` | `release` | `True` | You want the shipped release defaults (production behaviour). |
+| `PAPER_MIRROR_DEFAULT` | `paper` | `True` | You want to reproduce the verbatim paper judge prompt for table comparisons. |
+
+Recipe table for the headline rows:
+
+| Goal | Command |
+|------|---------|
+| Release default (this repo) | `python run.py trajectory.json` |
+| Paper Tables 4 (best cell) — paper prompt | `python run.py trajectory.json --prompt-style paper` |
+| Paper "without NL-check violations" ablation | `python run.py trajectory.json --prompt-style paper --exclude-nl-violations` |
+| Release sanity — no violation context at all | `python run.py trajectory.json --no-context` |
+
+`--prompt-style` and `--include/--exclude-nl-violations` compose orthogonally
+with the other ablation flags above. Both knobs are first-class fields on
+`RunConfig` (`agentrx/pipeline/profiles.py`) and are validated at construction
+time via `Literal[...]` membership; passing an invalid value raises before any
+LLM call is issued. There are **no environment variables** that silently
+toggle judge behaviour — every paper axis is a CLI flag, recorded into
+`run_config.json` for every run.
+
+### Reproduction driver scripts
+
+The end-to-end paper sweeps and aggregators live under the top-level
+[scripts/](scripts/) package so they stay versioned and importable:
+
+| Script | Purpose |
+|--------|---------|
+| `python -m scripts.run_tau_ablation` | Runs the τ-bench paper ablation cells (every `prompt_mode` × `exec_mode` × `prompt_style`) and stores per-cell `runs/` outputs. |
+| `python -m scripts.score_tau_ablation` | Aggregates per-run JSON across the τ ablation cells into a single side-by-side table. |
+| `python -m scripts.score_flash` | Aggregates Flash-domain runs (requires the internal Flash dataset). |
+| `bash scripts/sweeps/run_tau29.sh` | One-shot driver for the 29-trajectory τ subset shipped under `data/tau_dataset/`. |
+| `bash scripts/sweeps/run_flash42.sh` | One-shot driver for the 42-trajectory Flash subset (internal only). |
+| `bash scripts/sweeps/run_magentic27.sh` | One-shot driver for the 27-trajectory `magentic*` subset. |
+
+The shell drivers resolve the repo root from their own location and honour
+two overrides for non-default Python environments and log destinations:
+
+```bash
+AGENTRX_PYTHON=/path/to/venv/bin/python \
+AGENTRX_LOG=/tmp/tau29.log \
+bash scripts/sweeps/run_tau29.sh
+```
+
+### Operational knobs (not paper axes)
+
+These tune runtime behaviour and are deliberately kept as environment
+variables — they do not affect any reported number:
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `AGENTRX_PYCHECK_TIMEOUT_SEC` | `2.0` | Wall-clock budget for each `python_check` invariant. The checker uses a `threading.Thread`+`join(timeout=...)` pattern (cross-platform — works on Windows, where `signal.SIGALRM` is unavailable). |
+
+### What this repo reproduces directly
+
+End-to-end from a fresh clone you can reproduce, on the trajectories shipped under [data/](data/):
+
+- **τ-bench retail rows** of Tables 4, 5, 6 — all `prompt_mode` × `exec_mode` × `with_context` cells.
+- **Magentic-One rows** of Tables 4, 5, 6 — same axes, run over the 44-trajectory `magentic_dataset/`.
+- **Magentic\*** (27-trajectory subset) rows — once you constrain inputs to the ids in [data/ground_truth/magentic_star_ids.json](data/ground_truth/magentic_star_ids.json). The id list is shipped; a `--subset` CLI filter is not yet wired into `run.py` (planned), so today you must filter input files manually.
+- **Table 3 (token statistics)** — derivable from per-run `judge_output/*.json` (a paper-format renderer is not yet ported into this repo; see below).
+
+### What this repo does not reproduce, and why
+
+- **Flash domain (Tables 4, 5, 6, and the Flash policy used by static invariant generation).** The Flash dataset is Microsoft-internal production incident data and cannot be redistributed. No GT or trajectories are shipped, and there is no public Flash policy. Flash rows of the paper cannot be reproduced from this repo alone.
+- **Table 2 (comparison against Who&When).** Requires running an external baseline; see the next section.
+- **Sampling determinism for `gpt-5` / `o3`.** The paper does not specify `temperature`, `top_p`, `seed`, or `max_tokens` for the judge LLM, and the underlying models are not bit-exact reproducible. Expect cell-level deviations within the n=3 standard deviations the paper reports.
+- **Headline 23.6% / 22.9% improvement figures from the abstract.** Those numbers are not traceable to a specific table cell in the camera-ready and cannot be regenerated from a single sweep.
+- **Constraint-generator prompts in the paper appendix** (sections marked `\TODO{}` in the LaTeX source). The actual prompts live in [agentrx/invariants/static_invariant_generator.py](agentrx/invariants/static_invariant_generator.py) / [dynamic_invariant_generator.py](agentrx/invariants/dynamic_invariant_generator.py); the paper text is incomplete, not the code.
+
+### Reproducing Table 2 (Who&When comparison)
+
+Table 2 compares AgentRx's judge against the **Who&When** (W&W) failure-attribution baseline, plus a prompt-modified variant the paper calls **W&W\***. W&W is third-party code with its own license and is not vendored here. To reproduce the table:
+
+1. Clone the upstream W&W repository:
+
+   ```bash
+   git clone https://github.com/mingyin1/Agents_Failure_Attribution
+   ```
+
+2. Run W&W's `Lib/utils.py:all_at_once` (and/or `step_by_step` / `binary_search`) judges against the 16-trajectory subset already shipped under [data/magentic_dataset_whowhen/](data/magentic_dataset_whowhen/). This subset is the intersection of the 44 Magentic GT trajectories with W&W's input-staging format, which is what the paper evaluates on.
+
+3. To reproduce the **W&W\*** row, apply the single prompt modification the paper specifies (`eval.tex` §4.2, "first unrecoverable critical step"): in W&W's prompt templates, replace `"the first mistake"` / `"first error"` / `"first made mistake"` with `"first UNRECOVERABLE critical mistake"`. Leave everything else (system prompt, ground-truth-in-prompt convention, output format, regex parsing) untouched so W&W's own `evaluate.py` works unmodified.
+
+4. Run AgentRx's judge against the same 16-trajectory subset under the paper-default recipe (see above) for the AgentRx row.
+
+5. Compare step-accuracy on those 16 trajectories. The paper reports W&W's `all_at_once` variant at ~12.5% on Magentic, W&W\* materially higher, and AgentRx materially higher again.
+
+A turnkey W&W runner has intentionally not been ported here pending a license/attribution review for the upstream `mingyin1` code; the procedure above is the supported path.
+
+---
+
 ## Configuration
 
 LLM settings are loaded from environment variables (via `.env` or shell):

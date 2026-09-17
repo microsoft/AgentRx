@@ -34,9 +34,9 @@ Outputs per trajectory (written to --out-dir/<task_id>/):
 import argparse
 import sys
 import os, json, re, time
+import threading
 import traceback 
 import io 
-from contextlib import redirect_stdout, redirect_stderr
 from dataclasses import dataclass, asdict
 import types
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -82,6 +82,15 @@ DEBUG_INV_DUMP = os.getenv("DEBUG_INV_DUMP", "1") == "1"
 DEBUG_ONLY_ASSERTION = os.getenv("DEBUG_ONLY_ASSERTION", "").strip() 
 DEBUG_MAX_JSON_CHARS = safe_int(os.getenv("DEBUG_MAX_JSON_CHARS", "4000")) or 4000 
 DEBUG_MAX_TEXT_CHARS = safe_int(os.getenv("DEBUG_MAX_TEXT_CHARS", "600")) or 600
+
+# Hard wall-clock cap for a single LLM-generated python_check (exec + fn call).
+# Prevents infinite loops in generated code from hanging the whole sweep.
+PYCHECK_TIMEOUT_SEC = safe_int(os.getenv("AGENTRX_PYCHECK_TIMEOUT_SEC", "30")) or 30
+
+
+class PyCheckTimeout(Exception):
+    """Raised when a python_check exceeds PYCHECK_TIMEOUT_SEC wall-clock seconds."""
+
 
 def dbg(msg: str) -> None:
     if DEBUG:
@@ -651,19 +660,68 @@ class AllVerifier:
    
             cap_out = io.StringIO()
             cap_err = io.StringIO()
-            if DEBUG_PY_CAPTURE_STDOUT and DEBUG_PY_EXEC and focus_inv(invariant):
-                with redirect_stdout(cap_out), redirect_stderr(cap_err):
-                    exec(code, glb, loc)
-            else:
-                exec(code, glb, loc)
 
-            if function_name not in loc:
+            # Cross-platform wall-clock timeout around exec + fn invocation.
+            #
+            # We run the LLM-generated check on a daemon thread and join it
+            # with a timeout. SIGALRM was previously used here but is Unix-only
+            # and the AgentRx supported targets include Windows (paper Table
+            # 1's WnW dataset is reproduced on Windows-WSL by collaborators).
+            #
+            # Trade-off (documented because Python lacks cooperative thread
+            # cancellation): if the runner is still alive after the timeout,
+            # it is abandoned and we proceed. daemon=True guarantees it does
+            # not block process exit. The abandoned thread leaks until exit,
+            # but cannot corrupt other checks because it writes only into the
+            # captured `cap_out` buffer (the safe-builtins `print` is wrapped
+            # below) — never into process-global sys.stdout/sys.stderr.
+            _runner_box: Dict[str, Any] = {}
+            _capture_streams = bool(DEBUG_PY_CAPTURE_STDOUT and DEBUG_PY_EXEC and focus_inv(invariant))
+            if _capture_streams:
+                _orig_print = _safe_builtins["print"]
+                def _captured_print(*args, **kwargs):
+                    kwargs.setdefault("file", cap_out)
+                    return _orig_print(*args, **kwargs)
+                _safe_builtins["print"] = _captured_print
+
+            def _pycheck_runner() -> None:
+                try:
+                    exec(code, glb, loc)
+                    if function_name not in loc:
+                        _runner_box["status"] = "no_fn"
+                        return
+                    fn = loc[function_name]
+                    if DEBUG_PY_EXEC and focus_inv(invariant):
+                        # Direct stdout — runs only when capture is disabled.
+                        dbg(f"[PY] calling {function_name}(traj, step_pos)")
+                    _runner_box["result"] = fn(traj, step_pos)
+                    _runner_box["status"] = "ok"
+                except BaseException as exc:
+                    _runner_box["status"] = "error"
+                    _runner_box["error"] = exc
+                    _runner_box["traceback"] = traceback.format_exc()
+
+            _t = threading.Thread(target=_pycheck_runner, name=f"pycheck:{assertion_name}", daemon=True)
+            _t.start()
+            _t.join(timeout=PYCHECK_TIMEOUT_SEC)
+
+            if _t.is_alive():
+                raise PyCheckTimeout(
+                    f"python_check '{assertion_name}' exceeded {PYCHECK_TIMEOUT_SEC}s"
+                )
+
+            status = _runner_box.get("status")
+            if status == "error":
+                # Re-raise inside the outer `try` so the existing telemetry
+                # path records the exception identically to in-thread raises.
+                raise _runner_box["error"]
+            if status == "no_fn":
                 end_time = time.perf_counter()
 
                 if DEBUG_PY_EXEC and focus_inv(invariant):
                     dbg(f"[PY] ERROR function not found: {function_name!r}")
                     dbg(f"[PY] available locals: {sorted(list(loc.keys()))[:50]}")
-                    if DEBUG_PY_CAPTURE_STDOUT:
+                    if _capture_streams:
                         o = cap_out.getvalue()
                         e = cap_err.getvalue()
                         if o.strip():
@@ -683,17 +741,12 @@ class AllVerifier:
                     check_output=None
                 ))
                 return None
-            
-            fn = loc[function_name]
 
-            if DEBUG_PY_EXEC and focus_inv(invariant):
-                dbg(f"[PY] calling {function_name}(traj, step_pos)")
-
-            result = fn(traj, step_pos)
+            result = _runner_box["result"]
 
             if DEBUG_PY_EXEC and focus_inv(invariant):
                 dbg(f"[PY] raw result type={type(result)} value={result!r}")
-                if DEBUG_PY_CAPTURE_STDOUT:
+                if _capture_streams:
                     o = cap_out.getvalue()
                     e = cap_err.getvalue()
                     if o.strip():

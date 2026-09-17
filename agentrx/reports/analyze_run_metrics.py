@@ -16,6 +16,8 @@ import numpy as np
 from collections import defaultdict
 from typing import Dict, List, Tuple, Any
 
+from agentrx.reports.step_accuracy import step_distance_to_nearest_gt
+
 # Failure case number to category mapping
 FAILURE_CASE_TO_CATEGORY = {
     1: "Instruction Adherence Failure",
@@ -33,14 +35,13 @@ FAILURE_CASE_TO_CATEGORY = {
 # Reverse mapping: category name to number
 CATEGORY_TO_FAILURE_CASE = {v: k for k, v in FAILURE_CASE_TO_CATEGORY.items()}
 
-# Ground truth file paths by domain
+# Ground truth file paths by domain (relative to repository root).
 DOMAIN_GROUND_TRUTH_PATHS = {
-    "tau": "ground_truth_tau_retail.json",
-    "flash": "pipeline/flash_dataset.json",
-    "magentic": "../dataset/magentic_one.json"
+    "tau":      "data/ground_truth/tau_ground_truth.json",
+    "magentic": "data/ground_truth/magentic_one_ground_truth.json",
+    "flash":    "data/ground_truth/flash_ground_truth.json",
 }
 
-# Default ground truth file path (for backward compatibility)
 GROUND_TRUTH_PATH = DOMAIN_GROUND_TRUTH_PATHS["tau"]
 
 
@@ -299,31 +300,26 @@ def compute_step_accuracy_std(summary: Dict, output_dir: str = None, gt_by_task:
                     continue
                 
                 gt_info = gt_by_task[task_id]
-                
-                # Get ground truth root cause step number
-                gt_step = None
-                root_cause_id = None
-                # We need to find the root cause step from failures
-                for f in gt_info.get('failures', []):
-                    if gt_info.get('root_cause_failure_id') == f.get('failure_id'):
-                        gt_step = f.get('step_number')
-                        break
-                
-                # If root_cause_failure_id not stored, try to find from original structure
-                if gt_step is None and gt_info.get('failures'):
-                    # Fallback: use the root cause step if available directly
-                    gt_step = gt_info.get('root_cause_step')
-                
-                if gt_step is None:
+
+                # All labelled GT failure steps for this trajectory. The metric
+                # scores the prediction against the NEAREST of these, not the
+                # root cause alone — otherwise a correct hit on a non-first GT
+                # failure is wrongly counted as a miss.
+                gt_steps = [
+                    int(f['step_number'])
+                    for f in gt_info.get('failures', [])
+                    if f.get('step_number') is not None
+                ]
+                if not gt_steps:
                     continue
-                
+
                 # Get predicted step from result
                 predicted_step = result.get('step_mean') or result.get('step_median')
                 if predicted_step is None:
                     continue
-                
-                # Calculate difference
-                diff = abs(predicted_step - gt_step)
+
+                # Distance to the nearest GT failure step.
+                diff = step_distance_to_nearest_gt(predicted_step, gt_steps)
                 
                 # Update counts for each tolerance
                 for tol in range(1, 6):

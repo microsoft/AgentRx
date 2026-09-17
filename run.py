@@ -41,6 +41,7 @@ if sys.platform == "win32":
 REPO_ROOT = Path(__file__).resolve().parent
 
 import agentrx.pipeline.globals as g
+from agentrx.pipeline.profiles import RunConfig, PAPER_DEFAULT
 
 # ---------- Stage definitions ----------
 
@@ -375,9 +376,17 @@ def run_check(ir_path: str, run_dir: str, domain: str, endpoint: str,
 # ---------- Stage: Judge ----------
 
 def run_judge(input_path: str, run_dir: str, domain: str, endpoint: str,
-              violation_context_dir: str = None, ground_truth_file: str = None) -> str:
-    """Run LLM-as-a-Judge. Returns path to judge output directory."""
+              violation_context_dir: str = None, ground_truth_file: str = None,
+              config: RunConfig = None) -> str:
+    """Run LLM-as-a-Judge. Returns path to judge output directory.
+
+    config selects the paper-table-cell recipe (prompt_mode / exec_mode /
+    with_context). Defaults to the paper-faithful recipe.
+    """
     import agentrx.judge.judge as judge_module
+
+    if config is None:
+        config = PAPER_DEFAULT
 
     banner("Stage 5/6: LLM-as-a-Judge")
 
@@ -387,9 +396,13 @@ def run_judge(input_path: str, run_dir: str, domain: str, endpoint: str,
     # Set globals that judge.py expects
     judge_module.DOMAIN = domain
     judge_module.ENDPOINT_USED = endpoint
-    judge_module.PROMPT_MODE = "combined"
-    judge_module.EXECUTION_MODE = "violations-after"
-    judge_module.RUN_WITH_CONTEXT = violation_context_dir is not None
+    judge_module.PROMPT_MODE = config.prompt_mode
+    judge_module.EXECUTION_MODE = config.exec_mode
+    judge_module.PROMPT_STYLE = config.prompt_style
+    judge_module.INCLUDE_NL_VIO = config.include_nl_check_violations
+    # with_context can only be honoured when the check stage produced a context
+    # directory; if it didn't, the profile's request collapses to False.
+    judge_module.RUN_WITH_CONTEXT = config.with_context and violation_context_dir is not None
     judge_module.USE_GROUND_TRUTH = ground_truth_file is not None
 
     if violation_context_dir:
@@ -404,8 +417,11 @@ def run_judge(input_path: str, run_dir: str, domain: str, endpoint: str,
     print(f"  [DEBUG][run_judge] ground_truth_file:     {ground_truth_file}")
     print(f"  [DEBUG][run_judge] PROMPT_MODE:           {judge_module.PROMPT_MODE}")
     print(f"  [DEBUG][run_judge] EXECUTION_MODE:        {judge_module.EXECUTION_MODE}")
+    print(f"  [DEBUG][run_judge] PROMPT_STYLE:          {judge_module.PROMPT_STYLE}")
+    print(f"  [DEBUG][run_judge] INCLUDE_NL_VIO:        {judge_module.INCLUDE_NL_VIO}")
     print(f"  [DEBUG][run_judge] RUN_WITH_CONTEXT:      {judge_module.RUN_WITH_CONTEXT}")
     print(f"  [DEBUG][run_judge] USE_GROUND_TRUTH:      {judge_module.USE_GROUND_TRUTH}")
+    print(f"  [DEBUG][run_judge] NUM_RUNS:              {config.num_runs}")
 
     # Load ground truth if provided
     gt_failures = None
@@ -419,18 +435,28 @@ def run_judge(input_path: str, run_dir: str, domain: str, endpoint: str,
     print(f"  [DEBUG][run_judge] api_version:           {api_version}")
     print(f"  [DEBUG][run_judge] model_name:            {model_name}")
 
-    # Run a single iteration.
     # Use the IR file (already normalized) so the judge doesn't re-normalize
     # and lose trajectories.
     ir_file = os.path.join(run_dir, "trajectory_ir.json")
-    judge_module.run_single_iteration(
-        run_number=1,
-        base_output_dir=judge_out_dir,
-        ground_truth_failures=gt_failures,
-        api_version=api_version,
-        model_name=model_name,
-        log_file=ir_file if os.path.exists(ir_file) else input_path,
-    )
+    log_file = ir_file if os.path.exists(ir_file) else input_path
+
+    # Perform `config.num_runs` independent judge iterations. The judge writes
+    # each iteration's per-task results to runs/run{N}.json under judge_out_dir.
+    for run_number in range(1, config.num_runs + 1):
+        if config.num_runs > 1:
+            print(f"\n  [run_judge] === Iteration {run_number}/{config.num_runs} ===")
+        judge_module.run_single_iteration(
+            run_number=run_number,
+            base_output_dir=judge_out_dir,
+            ground_truth_failures=gt_failures,
+            api_version=api_version,
+            model_name=model_name,
+            log_file=log_file,
+        )
+
+    # When > 1 iteration was run, emit the mean/std aggregate the paper reports.
+    if config.num_runs > 1:
+        judge_module.create_aggregate_summary(judge_out_dir, config.num_runs)
 
     print(f"  Output: {judge_out_dir}")
     return judge_out_dir
@@ -545,7 +571,54 @@ Examples:
                         help="Custom name for this run (default: auto-generated)")
     parser.add_argument("--run-dir", default=None,
                         help="Resume into an existing run directory")
+
+    # --- Judge-stage knobs (override individual axes of agentrx.pipeline.profiles.PAPER_DEFAULT) ---
+    parser.add_argument("--prompt-mode", default=PAPER_DEFAULT.prompt_mode,
+                        choices=["baseline", "checklist", "examples", "combined"],
+                        help=f"Judge prompt taxonomy mode (default: {PAPER_DEFAULT.prompt_mode}, paper-faithful)")
+    parser.add_argument("--exec-mode", default=PAPER_DEFAULT.exec_mode,
+                        choices=["violations-after", "stepbystep", "violations-before"],
+                        help=f"Judge execution mode (default: {PAPER_DEFAULT.exec_mode}, paper-faithful)")
+    parser.add_argument("--prompt-style", default=PAPER_DEFAULT.prompt_style,
+                        choices=["paper", "release"],
+                        help=f"Judge system-prompt builder (default: {PAPER_DEFAULT.prompt_style!r}). "
+                             "'release' is the originally-released f-string templates and dominates the "
+                             "paper-mirror style on the tau-29 ablation. 'paper' reproduces the paper-mirror "
+                             "concat builder verbatim.")
+    parser.add_argument("--no-context", action="store_true",
+                        help="Do not inject deduplicated violation context into the judge prompt "
+                             "(paper-faithful default injects context when the check stage produced it)")
+    nl_group = parser.add_mutually_exclusive_group()
+    nl_group.add_argument("--include-nl-violations", dest="include_nl_violations",
+                          action="store_true", default=None,
+                          help=f"Include nl_check violations in the judge context (default: "
+                               f"{PAPER_DEFAULT.include_nl_check_violations}, paper-faithful)")
+    nl_group.add_argument("--exclude-nl-violations", dest="include_nl_violations",
+                          action="store_false",
+                          help="Drop nl_check violations from the judge context "
+                               "(reproduces the paper's 'Without NL Check Viol.' appendix table)")
+    parser.add_argument("--num-runs", type=int, default=PAPER_DEFAULT.num_runs,
+                        help=f"Number of independent judge iterations (default: {PAPER_DEFAULT.num_runs}, "
+                             "paper-faithful). When >1, writes runs/run{N}.json per iteration and "
+                             "emits a mean/std aggregate summary.")
+
     args = parser.parse_args()
+
+    # Resolve judge-stage axes into a single immutable RunConfig that flows
+    # through run_pipeline -> run_judge. Anything not overridden inherits from
+    # PAPER_DEFAULT, so an unflagged invocation produces the paper recipe.
+    args.judge_config = RunConfig(
+        prompt_mode=args.prompt_mode,
+        exec_mode=args.exec_mode,
+        with_context=PAPER_DEFAULT.with_context and not args.no_context,
+        num_runs=args.num_runs,
+        prompt_style=args.prompt_style,
+        include_nl_check_violations=(
+            PAPER_DEFAULT.include_nl_check_violations
+            if args.include_nl_violations is None
+            else args.include_nl_violations
+        ),
+    )
 
     input_path = os.path.abspath(args.input)
     if not os.path.exists(input_path):
@@ -707,6 +780,7 @@ def run_pipeline(input_path: str, args):
                 ir_path, run_dir, domain, args.endpoint,
                 violation_context_dir=violation_ctx,
                 ground_truth_file=args.ground_truth,
+                config=args.judge_config,
             )
             state["completed_stages"] = list(set(state.get("completed_stages", [])) | {"judge"})
             save_state(run_dir, state)

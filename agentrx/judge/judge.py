@@ -32,6 +32,7 @@ try:
     
     # Analysis & Pipeline tools
     from agentrx.reports.analyze_failure_frequencies import load_and_analyze_json, plot_predicted_frequency, plot_ground_truth_frequency, plot_comparison
+    from agentrx.reports.step_accuracy import step_distance_to_nearest_gt
     from agentrx.ir.trajectory_ir import tau_bench_ir, load_trajectories, flash_ir, magentic_ir, validate_ir, llm_ir, ensure_ir
     from agentrx.invariants.domain_registry import DOMAIN_REGISTRY, get_domain_config, register_domain
 except ImportError:
@@ -49,6 +50,15 @@ USE_GROUND_TRUTH = True
 PROMPT_MODE = "combined"     # "baseline", "checklist", "examples", "combined"
 EXECUTION_MODE = "violations-after" # "violations-after", "stepbystep", "violations-before"
 DOMAIN = None
+# Judge prompt builder selection. "release" = originally-released f-string
+# templates (default; validated on tau-29 n=3: cat 0.425 / step 0.494 vs
+# paper-mirror 0.414 / 0.379). "paper" = paper-mirror concat builder.
+# Set by run.py::run_judge from RunConfig.prompt_style; never read from env.
+PROMPT_STYLE = "release"
+# Whether the judge sees nl_check violations. False reproduces the paper's
+# "Without NL Check Viol." appendix table. Set by run.py::run_judge from
+# RunConfig.include_nl_check_violations; never read from env.
+INCLUDE_NL_VIO = True
 
 # Directory paths (can be overridden via command line)
 EXAMPLES_DIR = None  # Will default to os.path.join(os.path.dirname(__file__), "few_shot_examples")
@@ -264,7 +274,7 @@ class FailureCase(Enum):
     INCONCLUSIVE = 10
 
 class Failure:
-    def __init__(self, task_id, failure_case, description, step_number, checklist_reasoning=None):
+    def __init__(self, task_id, failure_case, description, step_number, checklist_reasoning=None, gt_step_numbers=None):
         self.task_id = task_id
         if isinstance(failure_case, int):
             try:
@@ -277,6 +287,11 @@ class Failure:
         self.description = description
         self.step_number = step_number
         self.checklist_reasoning = checklist_reasoning
+        # Only meaningful when this Failure represents the ground truth for a
+        # task that may have multiple labelled failures: the full sorted set of
+        # GT failure step indices. For prediction Failures this stays None and
+        # downstream code falls back to (step_number,).
+        self.gt_step_numbers = tuple(sorted(int(s) for s in gt_step_numbers)) if gt_step_numbers else None
 
 class Report:
     def __init__(self, task_id, trajectory_length=1):
@@ -332,6 +347,7 @@ class Report:
         step_numbers = [f.step_number for f in self.failures]
         gt_failure_case = gt_failure.failure_case
         gt_step_number = gt_failure.step_number
+        gt_step_numbers = gt_failure.gt_step_numbers or (gt_step_number,)
         total = len(self.failures)
 
         if total == 0:
@@ -361,9 +377,11 @@ class Report:
         self.step_min = min(step_numbers) if step_numbers else 0
         self.step_max = max(step_numbers) if step_numbers else 0
         
-        # Comparison to Ground Truth
+        # Comparison to Ground Truth — step distance is computed against the
+        # NEAREST GT failure step, not a positional pick, so a correct hit on
+        # a non-first failure in a multi-failure trajectory still counts.
         failure_matches = [fc == gt_failure_case for fc in failure_cases]
-        step_abs_errors = [abs(s - gt_step_number) for s in step_numbers]
+        step_abs_errors = [step_distance_to_nearest_gt(s, gt_step_numbers) for s in step_numbers]
 
         self.failure_case_accuracy = sum(failure_matches) / total if total > 0 else 0
         self.step_mae = mean(step_abs_errors) if step_abs_errors else 0
@@ -371,21 +389,34 @@ class Report:
 
         self.gt_failure_case = str(gt_failure.failure_case.value)
         self.gt_step_number = gt_failure.step_number
+        self.gt_step_numbers = list(gt_step_numbers)
         self.gt_failure_description = gt_failure.description
 
 # --- Few-Shot Examples (from Refactored) ---
 
 def load_few_shot_examples():
-    """Load few-shot examples from the few_shot_examples directory."""
+    """Load the per-category few-shot examples shipped with the judge.
+
+    Raises FileNotFoundError listing every missing / malformed file. The
+    loader is reachable only from ``ensure_few_shot_examples_loaded`` which
+    is in turn called only when ``PROMPT_MODE`` actually requires examples
+    (``examples`` or ``combined``), so reaching this point with a missing
+    file is a configuration error, not a degraded mode — silently substituting
+    "No example available." would change what the judge sees on a per-run
+    basis and make Tab-1/Tab-2 numbers irreproducible.
+
+    Category 10 (INCONCLUSIVE) intentionally has no example file and is
+    omitted from the returned dict; callers must handle its absence.
+    """
     global EXAMPLES_DIR
-    
-    # Use global EXAMPLES_DIR if set, otherwise use default
-    if EXAMPLES_DIR is None:
-        examples_dir = os.path.join(os.path.dirname(__file__), "few_shot_examples")
-    else:
-        examples_dir = EXAMPLES_DIR
-    
-    # Mapping of category numbers to their example file names
+
+    examples_dir = (
+        EXAMPLES_DIR
+        if EXAMPLES_DIR is not None
+        else os.path.join(os.path.dirname(__file__), "few_shot_examples")
+    )
+
+    # Category number → filename. None means "no example for this category".
     example_files = {
         1: "instruction_adherence_failure.json",
         2: "invention_of_new_information.json",
@@ -396,40 +427,39 @@ def load_few_shot_examples():
         7: "intent_not_supported.json",
         8: "guardrails_triggered.json",
         9: "system_failure.json",
-        10: None 
+        10: None,
     }
-    
+
+    if not os.path.isdir(examples_dir):
+        raise FileNotFoundError(
+            f"Few-shot examples directory does not exist: {examples_dir}. "
+            f"PROMPT_MODE requires examples; either point --examples_dir at "
+            f"a populated directory or switch PROMPT_MODE."
+        )
+
     examples = {}
-    loaded_count = 0
-    missing_count = 0
-    skipped_count = 0
-    
-    print(f"[FEW-SHOT] Looking for examples in: {examples_dir}")
-    if not os.path.exists(examples_dir):
-        print(f"[FEW-SHOT] WARNING: Examples directory does not exist: {examples_dir}")
-    
+    errors = []
     for category_num, filename in example_files.items():
-        if filename:
-            path = os.path.join(examples_dir, filename)
-            try:
-                with open(path, 'r') as f:
-                    examples[category_num] = json.load(f)
-                    loaded_count += 1
-                    print(f"[FEW-SHOT] [OK] Loaded example for category {category_num}: {filename}")
-            except FileNotFoundError:
-                examples[category_num] = None
-                missing_count += 1
-                print(f"[FEW-SHOT] [MISS] Missing example for category {category_num}: {filename}")
-            except json.JSONDecodeError as e:
-                examples[category_num] = None
-                missing_count += 1
-                print(f"[FEW-SHOT] [ERR] Invalid JSON in example for category {category_num}: {filename} - {e}")
-        else:
-            examples[category_num] = None
-            skipped_count += 1
-    
-    print(f"[FEW-SHOT] Summary: {loaded_count} loaded, {missing_count} missing, {skipped_count} skipped (no file defined)")
-    
+        if filename is None:
+            continue
+        path = os.path.join(examples_dir, filename)
+        try:
+            with open(path, "r") as f:
+                examples[category_num] = json.load(f)
+        except FileNotFoundError:
+            errors.append(f"  category {category_num}: missing {path}")
+        except json.JSONDecodeError as e:
+            errors.append(f"  category {category_num}: invalid JSON in {path} — {e}")
+
+    if errors:
+        raise FileNotFoundError(
+            "Few-shot examples required by PROMPT_MODE but unavailable:\n"
+            + "\n".join(errors)
+        )
+
+    print(
+        f"[FEW-SHOT] Loaded {len(examples)} per-category examples from {examples_dir}"
+    )
     return examples
 
 # Initialize as None - will be loaded in main() after parsing args
@@ -443,8 +473,6 @@ def ensure_few_shot_examples_loaded():
     return FEW_SHOT_EXAMPLES
 
 def format_example_for_prompt(example_data):
-    if example_data is None or (isinstance(example_data, str) and not example_data.strip()):
-        return "No example available."
     example_json = json.dumps(example_data, separators=(',', ': '))
     return f"```json\n{example_json}\n```"
 
@@ -495,85 +523,28 @@ def build_taxonomy_text(mode):
     return taxonomy_text
 
 # ---------------------------------------------------------------------------
-# Prompt templates — each is self-contained with {taxonomy_block} and
-# {invariants_violation_context} placeholders.  Use double-braces {{ }} to
-# escape literal braces in the JSON examples.
+# System prompt — verbatim paper version.
 #
-# Matches the 5 active templates from agentrx.judge.py:
-#   _TMPL_VIOLATIONS_BEFORE  ↔  BASE_SYSTEM_PROMPT_VIOLATIONS_BEFORE
-#   _TMPL_NO_CONTEXT         ↔  BASE_SYSTEM_PROMPT
-#   _TMPL_WITH_CONTEXT       ↔  BASE_SYSTEM_PROMPT_WITH_CONTEXT
-#   _TMPL_FAILURE            ↔  FAILURE_PROMPT
-#   STEP_INDEX_PROMPT_TEMPLATE (already defined above)  ↔  STEP_INDEX_PROMPT
+# The judge's system prompt is assembled at call time from four pieces:
+#   1. ``prompt_top``: role prime + task framing. The "and exactly which step
+#      index the failure occurred at." clause is appended only when the judge
+#      is also expected to localize the step (i.e. when ``is_failure_prompt``
+#      is False — see Phase 2 of stepbystep, which still asks for the index
+#      and discards it, matching the paper).
+#   2. ``taxonomy_section``: result of ``build_taxonomy_text(PROMPT_MODE)``.
+#   3. ``prompt_procedure``: one of three variants, branched ONLY on
+#      ``(invariants_violation_context, is_failure_prompt)``. EXECUTION_MODE
+#      ("violations-before" vs "violations-after") is a pipeline-ordering
+#      concern — it controls *when* invariants are computed and whether they
+#      are passed in, not how they are framed to the judge — so it is
+#      deliberately NOT read here.
+#   4. ``output_format``: branched only on ``is_failure_prompt``.
 # ---------------------------------------------------------------------------
 
-_TMPL_VIOLATIONS_BEFORE = """
-GIVEN INPUT:
-- a full trajectory of an agent's interaction with a user (step-indexed)
-- the ground-truth tool-call/action sequence the agent should have made
-- optional: expected responses/outputs for some steps
-
-YOUR TASK is to determine why the agent failed, which failure category applies from the taxonomy below, and exactly which step index the failure occurred at.
-
-You are also provided a list of violations that have been generated through the trajectory through various invariants. Use these to help you identify the root cause category, failure step and agent.
-Static invariants have been generated through the domain policy and system prompt. Each static invariant is associated with a tool call to ensure it adheres to the domain policy.
-Dynamic invariants have been generated to cover computation checks, data accuracy, argument validity, and tool output consistency.
-Each invariant returns a boolean, and if it returns false, it indicates a violation. Note that some violations may be false positives and not all violations may be relevant to the root cause failure.
-
-Here are the list of violations noted by static and dynamic invariants:
-
-{invariants_violation_context}
-
-FAILURE TAXONOMY CATEGORIES:
-{taxonomy_block}
-
-ROOT-CAUSE DETECTION ALGORITHM:
-
-Step 1 — Locate the first failure: Scan the trajectory step-by-step from the start and record the first failure.
-Step 2 — Check if that failure was resolved: Look ahead in the trajectory for evidence that the error was resolved. If yes → Resolved; if no such evidence → Not resolved.
-Step 3 — Decide and continue:
-If Resolved: continue scanning from the next step to find the next new failure, then repeat Step 2 for it.
-If Not resolved: treat this step as the root-cause failure for the run and assign the taxonomy at this step.
-
-Output a JSON object in the following format:
-{{
-    "reason_for_failure": <string>,
-    "failure_case": <int 1-10>,
-    "reason_for_index": <string>,
-    "index": <int>
-}}
-""".strip()
-
-_TMPL_NO_CONTEXT = """
-GIVEN INPUT:
-- a full trajectory of an agent's interaction with a user (step-indexed)
-- the ground-truth tool-call/action sequence the agent should have made
-- optional: expected responses/outputs for some steps
-
-YOUR TASK is to determine why the agent failed, which failure category applies from the taxonomy below, and exactly which step index the failure occurred at.
-
-FAILURE TAXONOMY CATEGORIES:
-{taxonomy_block}
-
-ROOT-CAUSE DETECTION ALGORITHM:
-
-Step 1 — Locate the first failure: Scan the trajectory step-by-step from the start and record the first failure.
-Step 2 — Check if that failure was resolved: Look ahead in the trajectory for evidence that the error was resolved. If yes → Resolved; if no such evidence → Not resolved.
-Step 3 — Decide and continue:
-If Resolved: continue scanning from the next step to find the next new failure, then repeat Step 2 for it.
-If Not resolved: treat this step as the root-cause failure for the run and assign the taxonomy at this step.
-
-Output a JSON object in the following format:
-{{
-    "taxonomy_checklist_reasoning": <string>,
-    "reason_for_failure": <string>,
-    "failure_case": <int 1-10>,
-    "reason_for_index": <string>,
-    "index": <int>
-}}
-""".strip()
-
-_TMPL_WITH_CONTEXT = """
+# Originally-released f-string templates (kept verbatim from the pre-paper-mirror
+# release of judge.py for the PROMPT_STYLE='release' path).
+# Section ordering: GIVEN INPUT / TAXONOMY / ALGORITHM / VIOLATIONS / OUTPUT.
+_REL_TMPL_WITH_CONTEXT = """
 GIVEN INPUT:
 - a full trajectory of an agent's interaction with a user (step-indexed)
 - the ground-truth tool-call/action sequence the agent should have made
@@ -611,22 +582,47 @@ Output a JSON object in the following format:
 }}
 """.strip()
 
-_TMPL_FAILURE = """
+_REL_TMPL_NO_CONTEXT = """
 GIVEN INPUT:
 - a full trajectory of an agent's interaction with a user (step-indexed)
 - the ground-truth tool-call/action sequence the agent should have made
-- the exact step index at which the failure occurs
+- optional: expected responses/outputs for some steps
 
-YOUR TASK is to determine why the agent failed and which failure category applies from the taxonomy below.
+YOUR TASK is to determine why the agent failed, which failure category applies from the taxonomy below, and exactly which step index the failure occurred at.
 
 FAILURE TAXONOMY CATEGORIES:
 {taxonomy_block}
 
-You are also provided a list of violations that have been generated through the trajectory through various invariants. Use these to help you identify the root cause category, failure step and agent.
-Static invariants have been generated through the domain policy and system prompt. Each static invariant is associated with a tool call to ensure it adheres to the domain policy.
-Dynamic invariants have been generated to cover computation checks, data accuracy, argument validity, and tool output consistency.
-Each invariant returns a boolean, and if it returns false, it indicates a violation. Note that some violations may be false positives and not all violations may be relevant to the root cause failure.
+ROOT-CAUSE DETECTION ALGORITHM:
 
+Step 1 — Locate the first failure: Scan the trajectory step-by-step from the start and record the first failure.
+Step 2 — Check if that failure was resolved: Look ahead in the trajectory for evidence that the error was resolved. If yes → Resolved; if no such evidence → Not resolved.
+Step 3 — Decide and continue:
+If Resolved: continue scanning from the next step to find the next new failure, then repeat Step 2 for it.
+If Not resolved: treat this step as the root-cause failure for the run and assign the taxonomy at this step.
+
+Output a JSON object in the following format:
+{{
+    "taxonomy_checklist_reasoning": <string>,
+    "reason_for_failure": <string>,
+    "failure_case": <int 1-10>,
+    "reason_for_index": <string>,
+    "index": <int>
+}}
+""".strip()
+
+_REL_TMPL_FAILURE = """
+GIVEN INPUT:
+- a full trajectory of an agent's interaction with a user (step-indexed)
+- the ground-truth tool-call/action sequence the agent should have made
+- optional: expected responses/outputs for some steps
+
+YOUR TASK is to determine why the agent failed, which failure category applies from the taxonomy below.
+
+FAILURE TAXONOMY CATEGORIES:
+{taxonomy_block}
+
+You are also provided a list of violations that have been generated through the trajectory through various invariants.
 Here are the list of violations noted by static and dynamic invariants:
 
 {invariants_violation_context}
@@ -638,22 +634,141 @@ Output a JSON object in the following format:
 }}
 """.strip()
 
+_REL_TMPL_VIOLATIONS_BEFORE = """
+GIVEN INPUT:
+- a full trajectory of an agent's interaction with a user (step-indexed)
+- the ground-truth tool-call/action sequence the agent should have made
+- optional: expected responses/outputs for some steps
 
-def get_system_prompt(invariants_violation_context=None, is_failure_prompt=False):
-    """Build the system prompt by selecting the right template and formatting it."""
+You are also provided a list of violations that have been generated through the trajectory through various invariants. Use these to help you identify the root cause category, failure step and agent.
+Static invariants have been generated through the domain policy and system prompt. Each static invariant is associated with a tool call to ensure it adheres to the domain policy.
+Dynamic invariants have been generated to cover computation checks, data accuracy, argument validity, and tool output consistency.
+Each invariant returns a boolean, and if it returns false, it indicates a violation. Note that some violations may be false positives and not all violations may be relevant to the root cause failure.
+
+Here are the list of violations noted by static and dynamic invariants:
+
+{invariants_violation_context}
+
+YOUR TASK is to determine why the agent failed, which failure category applies from the taxonomy below, and exactly which step index the failure occurred at.
+
+FAILURE TAXONOMY CATEGORIES:
+{taxonomy_block}
+
+ROOT-CAUSE DETECTION ALGORITHM:
+
+Step 1 — Locate the first failure: Scan the trajectory step-by-step from the start and record the first failure.
+Step 2 — Check if that failure was resolved: Look ahead in the trajectory for evidence that the error was resolved. If yes → Resolved; if no such evidence → Not resolved.
+Step 3 — Decide and continue:
+If Resolved: continue scanning from the next step to find the next new failure, then repeat Step 2 for it.
+If Not resolved: treat this step as the root-cause failure for the run and assign the taxonomy at this step.
+
+Output a JSON object in the following format:
+{{
+    "taxonomy_checklist_reasoning": <string>,
+    "reason_for_failure": <string>,
+    "failure_case": <int 1-10>,
+    "reason_for_index": <string>,
+    "index": <int>
+}}
+""".strip()
+
+def _get_system_prompt_release(invariants_violation_context=None, is_failure_prompt=False):
+    """Originally-released prompt builder (pre-paper-mirror).
+
+    Section order: GIVEN-INPUT / TAXONOMY / ALGORITHM / VIOLATIONS / OUTPUT.
+    Activated when PROMPT_STYLE == 'release' (the default; set from
+    RunConfig.prompt_style by run.py::run_judge).
+    """
     taxonomy_block = build_taxonomy_text(PROMPT_MODE)
     inv = invariants_violation_context or ""
 
     if is_failure_prompt:
-        template = _TMPL_FAILURE
+        template = _REL_TMPL_FAILURE
     elif invariants_violation_context and EXECUTION_MODE == "violations-before":
-        template = _TMPL_VIOLATIONS_BEFORE
+        template = _REL_TMPL_VIOLATIONS_BEFORE
     elif invariants_violation_context:
-        template = _TMPL_WITH_CONTEXT
+        template = _REL_TMPL_WITH_CONTEXT
     else:
-        template = _TMPL_NO_CONTEXT
-
+        template = _REL_TMPL_NO_CONTEXT
     return template.format(taxonomy_block=taxonomy_block, invariants_violation_context=inv)
+
+
+def get_system_prompt(invariants_violation_context=None, is_failure_prompt=False):
+    if PROMPT_STYLE == "release":
+        return _get_system_prompt_release(invariants_violation_context, is_failure_prompt)
+    taxonomy_section = build_taxonomy_text(PROMPT_MODE)
+
+    prompt_top = """
+You are an Expert Failure-Categorization Judge. You will be provided with a trajectory of an agent's interaction with a user.
+Given:
+- a full trajectory of an agent's conversation with the user (step-indexed)
+- the ground-truth tool-call sequence the agent should have made and
+- (optional) Further, sometimes you may also be provided with a set of responses that the agent should have made in its response to the user at some step in the trajectory. Along with them, we will supply a boolean value indicating whether the agent's response included that output or not.
+
+YOUR TASK is determine why the agent failed, which failure category applies from the taxonomy below.
+"""
+    if not is_failure_prompt:
+        prompt_top += "and exactly which step index the failure occurred at.\n"
+
+    prompt_top += f"{taxonomy_section}\n"
+
+    if invariants_violation_context and not is_failure_prompt:
+        prompt_procedure = f"""
+You are also provided a list of violations that have been generated through the trajectory through various invariants. Use these to help you identify the root cause category, failure step and agent.
+Static invariants have been generated through the domain policy and system prompt. Each static invariant is associated with a tool call to ensure it adheres to the domain policy.
+Dynamic invariants have been generated to cover computation checks, data accuracy, argument validity, and tool output consistency.
+Each invariant returns a boolean, and if it returns false, it indicates a violation. Note that some violations may be false positives and not all violations may be relevant to the root cause failure.
+
+Here are the list of violations noted by static and dynamic invariants:
+
+{invariants_violation_context}
+
+ROOT-CAUSE DETECTION ALGORITHM:
+
+Step 1 — Locate the first failure: Scan the trajectory step-by-step from the start. The first step where the agent deviates from the intended plan or emits an error is the first failure. Record the step index and a short failure note.
+Step 2 — Check if that failure was resolved: Look ahead in the trajectory for evidence that the error was resolved. If yes → Resolved; if no such evidence → Not resolved.
+Step 3 — Decide and continue:
+If Resolved: continue scanning from the next step to find the next new failure, then repeat Step 2 for it.
+If Not resolved: treat this step as the root-cause failure for the run and assign the taxonomy at this step.
+"""
+    elif invariants_violation_context and is_failure_prompt:
+        prompt_procedure = f"""
+You are also provided a list of violations that have been generated through the trajectory through various invariants. 
+Here are the list of violations noted by static and dynamic invariants:
+{invariants_violation_context}
+"""
+    else:
+        prompt_procedure = """
+How to Judge (Decision Procedure):
+
+Step 1 — Locate the first failure: Scan the trajectory step-by-step from the start. The first step where the agent deviates from the intended plan or emits an error is the first failure. Record the step index and a short failure note.
+Step 2 — Check if that failure was resolved: Look ahead in the trajectory for evidence that the error was resolved. If yes → Resolved; if no such evidence → Not resolved.
+Step 3 — Decide and continue:
+If Resolved: continue scanning from the next step to find the next new failure, then repeat Step 2 for it.
+If Not resolved: treat this step as the root-cause failure for the run and assign the taxonomy at this step.
+"""
+
+    if is_failure_prompt:
+        output_format = """
+Output a JSON object in the following format:
+{
+    "reason_for_failure": <string>,
+    "failure_case": <int 1-10>
+}
+"""
+    else:
+        output_format = """
+Output a JSON object in the following format:
+{
+    "taxonomy_checklist_reasoning": <string>,  // Reasoning based on the taxonomy checklist (if applicable)
+    "reason_for_failure": <string>,
+    "failure_case": <int 1-10>,
+    "reason_for_index": <string>,
+    "index": <int>
+}
+"""
+
+    return (prompt_top + prompt_procedure + output_format).strip()
 
 
 # --- Synth Normalizer (from Updated) ---
@@ -891,14 +1006,20 @@ def get_llm_judge_class():
                 if failure_index is None:
                     raise RuntimeError(f"Step 1 Index Parse Error after {max_retries} attempts: {last_error}")
 
-                # Phase 2: Get Failure Category with retry logic
+                # Phase 2: Get Failure Category with retry logic.
+                # Paper spec: Phase 2 uses the FULL system prompt (same shape
+                # as the single-pass call), NOT a stripped failure-only prompt.
+                # The user message is the unmodified trajectory — the Phase 1
+                # index is NOT injected into the user message, otherwise the
+                # judge anchors on it and step localization in Phase 2 leaks
+                # into the category decision. We deliberately discard any
+                # ``index`` field returned by Phase 2 and keep Phase 1's
+                # ``failure_index`` as the canonical step number.
                 failure_system_prompt = get_system_prompt(
-                    invariants_violation_context=invariants_violation_context, 
-                    is_failure_prompt=True
+                    invariants_violation_context=invariants_violation_context,
+                    is_failure_prompt=False
                 )
-                
-                user_message_b = f"{user_message}\n\nFAILURE STEP INDEX: {failure_index}\n\n"
-                
+
                 completion = None
                 last_error = None
                 for attempt in range(1, max_retries + 1):
@@ -906,7 +1027,7 @@ def get_llm_judge_class():
                         resp_cat = self.get_llm_response(
                             messages=[
                                 {"role": "system", "content": failure_system_prompt},
-                                {"role": "user", "content": user_message_b}
+                                {"role": "user", "content": user_message}
                             ]
                         )
                         completion = self._parse_json_response(resp_cat, "Step 2 Category")
@@ -1003,6 +1124,10 @@ def load_invariant_violation_context(task_id):
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             context_data = json.load(f)
+            if not INCLUDE_NL_VIO and isinstance(context_data, list):
+                before = len(context_data)
+                context_data = [v for v in context_data if not (isinstance(v, dict) and v.get("check_type") == "nl_check")]
+                print(f"[CONTEXT] [FILTER] include_nl_check_violations=False: dropped {before - len(context_data)} nl_check violations (kept {len(context_data)})")
             print(f"[CONTEXT] [OK] Loaded violation context for task {task_id}: {file_path}")
             return context_data
     except FileNotFoundError:
@@ -1184,7 +1309,18 @@ def load_failures_from_json(file_path):
     failures = []
     for item in items:
         # Support both old and new gt formats if possible
-        
+
+        # All labelled GT failure steps for this trajectory — the metric scores
+        # a prediction against the NEAREST of these, not the root cause alone.
+        all_gt_steps = None
+        if isinstance(item.get("failures"), list) and item["failures"]:
+            try:
+                all_gt_steps = tuple(
+                    sorted(int(f.get("step_number", 0)) for f in item["failures"])
+                )
+            except (TypeError, ValueError):
+                all_gt_steps = None
+
         # Check for new format (root_cause object)
         if 'root_cause' in item and isinstance(item['root_cause'], dict):
             try:
@@ -1199,7 +1335,8 @@ def load_failures_from_json(file_path):
                              task_id=task_id,
                              failure_case=convert_to_failure_case(rc_failure.get('failure_category') or rc_failure.get('failure_case')),
                              description=item['root_cause'].get('reason_for_root_cause', ""),
-                             step_number=int(rc_failure.get('step_number', 0))
+                             step_number=int(rc_failure.get('step_number', 0)),
+                             gt_step_numbers=all_gt_steps,
                          ))
                          continue
 
@@ -1208,7 +1345,8 @@ def load_failures_from_json(file_path):
                     task_id=task_id,
                     failure_case=convert_to_failure_case(item['root_cause'].get('failure_category') or item['root_cause'].get('failure_case') or "inconclusive"),
                     description=item['root_cause'].get('reason_for_root_cause', ""),
-                    step_number=int(item['root_cause'].get('index', 0))
+                    step_number=int(item['root_cause'].get('index', 0)),
+                    gt_step_numbers=all_gt_steps,
                 ))
             except Exception as e:
                 print(f"Error parsing item {item.get('trajectory_id')}: {e}")
@@ -1222,7 +1360,8 @@ def load_failures_from_json(file_path):
                 task_id=item.get("task_id", item.get("trajectory_id")), 
                 failure_case=convert_to_failure_case(fc_val), 
                 description=item.get("reason_for_failure", ""), 
-                step_number=int(item.get("index", item.get("failure_step", 0)))
+                step_number=int(item.get("index", item.get("failure_step", 0))),
+                gt_step_numbers=all_gt_steps,
             ))
     
     # Debug: print loaded failures
@@ -1266,8 +1405,12 @@ def analysis(data, output_file_path=None, model_name=None, api_version=None):
         # step_mean might be float
         step_mean = task.get('step_mean', 0)
         gt_step = task.get('gt_step_number', 0)
-        
-        distance = abs(step_mean - gt_step)
+        # Distance / step-accuracy are measured against the NEAREST GT failure
+        # step for the trajectory; ``gt_step_number`` (root cause) is only a
+        # fallback for old reports without the full GT-step set.
+        gt_steps = task.get('gt_step_numbers') or [gt_step]
+        step_error = step_distance_to_nearest_gt(step_mean, gt_steps)
+        distance = step_error
         trajectory_length = task.get('trajectory_length', 1)
         normalized_distance = distance / trajectory_length if trajectory_length > 0 else distance
         
@@ -1282,14 +1425,14 @@ def analysis(data, output_file_path=None, model_name=None, api_version=None):
             incorrect_distance += distance
             incorrect_normalized_distance += normalized_distance
         
-        # Step accuracy (rounded)
-        if round(step_mean) == gt_step:
+        # Step accuracy: prediction is "correct" iff its rounded step lands on
+        # ANY GT failure step.
+        if step_error == 0:
             correct_step_predictions += 1
         else:
             incorrect_step_predictions += 1
         
-        # Tolerance-based step accuracy
-        step_error = abs(round(step_mean) - gt_step)
+        # Tolerance-based step accuracy (same nearest-GT distance).
         for tolerance in [1, 2, 3, 4, 5]:
             if step_error <= tolerance:
                 step_within_tolerance[tolerance] += 1
@@ -1334,22 +1477,14 @@ def analysis(data, output_file_path=None, model_name=None, api_version=None):
     
     if output_file_path:
         try:
-            # We assume output_file_path already has the list of reports written to it 
-            # OR we rewrite it completely.
-            # In run_single_iteration we write the list first.
-            if os.path.exists(output_file_path):
-                with open(output_file_path, 'r') as f:
-                    existing_data = json.load(f)
-                # Handle either format:
-                #   - list of per-task dicts (legacy)
-                #   - {"summary": ..., "detailed_results": [...]} (current)
-                if isinstance(existing_data, dict) and "detailed_results" in existing_data:
-                    existing_data = existing_data["detailed_results"]
-                # Fallback: if format is unexpected, prefer the freshly-computed `data`
-                if not isinstance(existing_data, list):
-                    existing_data = data
-            else:
-                existing_data = data # Should match
+            # The freshly-computed `data` is the single source of truth for
+            # what goes on disk. Reading back any pre-existing
+            # ``output_file_path`` here is unsafe: an earlier AAD-interrupted
+            # write, a stale skeleton dropped by a sibling stage, or simply
+            # the previous run's detailed_results would silently overwrite the
+            # current run's results, while the summary printed below still
+            # reflects `data`. The on-disk file is an artifact, not a source.
+            existing_data = data
 
             # Calculate aggregate token and timing metrics
             total_prompt_tokens = 0
@@ -1502,7 +1637,11 @@ def load_and_analyze_run_for_metrics(json_path):
             if 'gt_failure_case' in r:
                 # Comparison logic
                 is_correct = str(r.get('failure_case')) == str(r.get('gt_failure_case'))
-                step_err = abs(int(r.get('step_number', 0)) - int(r.get('gt_step_number', 0)))
+                gt_step = int(r.get('gt_step_number', 0))
+                gt_steps = r.get('gt_step_numbers') or [gt_step]
+                step_err = step_distance_to_nearest_gt(
+                    r.get('step_mean', r.get('step_number', 0)), gt_steps
+                )
                 # For normalization, we need trajectory length. 
                 # Ideally report has 'trajectory_length'
                 traj_len = r.get('trajectory_length', 1)
@@ -1804,7 +1943,7 @@ def create_aggregate_summary(base_output_dir, num_iterations):
 
 def main():
     global RUN_WITH_CONTEXT, ENDPOINT_USED, PROMPT_MODE, EXECUTION_MODE, DOMAIN, USE_GROUND_TRUTH
-    global EXAMPLES_DIR, VIOLATION_CONTEXT_DIR, FEW_SHOT_EXAMPLES
+    global EXAMPLES_DIR, VIOLATION_CONTEXT_DIR
     
     parser = argparse.ArgumentParser(
         description='LLM Judge Merged - Evaluation System for AI Agent Failures',
@@ -1847,8 +1986,9 @@ def main():
     if args.violation_context_dir:
         VIOLATION_CONTEXT_DIR = args.violation_context_dir
     
-    # Load few-shot examples now that EXAMPLES_DIR is set
-    FEW_SHOT_EXAMPLES = load_few_shot_examples()
+    # Few-shot examples are loaded lazily by build_taxonomy_text() when
+    # PROMPT_MODE actually needs them; loading eagerly here would force every
+    # run (including baseline/checklist modes) to require example assets.
     
     PROMPT_MODE = args.prompt_mode
     EXECUTION_MODE = args.exec_mode

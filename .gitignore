@@ -1,8 +1,12 @@
 __pycache__/
 .env
 runs/
-src/invariants/dynamic_invariant_outputs/
-papers/
-related_works.md
-partners/
 agentrx.egg-info/
+.pytest_cache/
+.pytest_tmp/
+
+# Internal Microsoft-only artefacts that may exist as symlinks/checkouts in
+# development trees but must never be redistributed.
+data/flash_dataset
+data/flash_dataset/
+data/ground_truth/flash_ground_truth.json

@@ -1,0 +1,114 @@
+{
+  "description": "Magentic*: 27-traj subset of GT-44 with <=50 substeps after IR. Matches paper Tab. 4 stepbystep row.",
+  "count": 27,
+  "ids": [
+    {
+      "trajectory_id": "42576abe-0deb-4869-8c63-225c2d75a95a",
+      "substeps": 5
+    },
+    {
+      "trajectory_id": "2aa5dd83fbcd0dce9a3dd4592106e5b5edf738008d932e357d477bba80e59ccf",
+      "substeps": 5
+    },
+    {
+      "trajectory_id": "56137764-b4e0-45b8-9c52-1866420c3df5",
+      "substeps": 5
+    },
+    {
+      "trajectory_id": "e6bc98089608217e45b6956a46518fe3cce64a799b3ac43c6974c449ae14c408",
+      "substeps": 8
+    },
+    {
+      "trajectory_id": "72e110e7-464c-453c-a309-90a95aed6538",
+      "substeps": 9
+    },
+    {
+      "trajectory_id": "929b45f34805280d77c61d1e093e3d4e551d77ddb6ecd73552b12b1af286388d",
+      "substeps": 12
+    },
+    {
+      "trajectory_id": "73c1b9fe-ee1d-4cf4-96ca-35c08f97b054",
+      "substeps": 13
+    },
+    {
+      "trajectory_id": "14569e28-c88c-43e4-8c32-097d35b9a67d",
+      "substeps": 16
+    },
+    {
+      "trajectory_id": "3af8028c2a59e28ca88baff0e6d91f2a9f170c5ef91003f1c8406755a2760ad4",
+      "substeps": 17
+    },
+    {
+      "trajectory_id": "6b06d186921b8b390c65aebd0d16f09f60a47d2f1288ebe36953f734e84c0a3c",
+      "substeps": 17
+    },
+    {
+      "trajectory_id": "f88066d274e265edd6cd9d61cd80a41accb3a14baf2297652fdd05cdf716d455",
+      "substeps": 17
+    },
+    {
+      "trajectory_id": "2dfc4c37-fec1-4518-84a7-10095d30ad75",
+      "substeps": 20
+    },
+    {
+      "trajectory_id": "42d4198c-5895-4f0a-b0c0-424a66465d83",
+      "substeps": 20
+    },
+    {
+      "trajectory_id": "52f7224e9c79431e7926afe317782711a0028750693e7456cde22ef6f4bd8bd5",
+      "substeps": 21
+    },
+    {
+      "trajectory_id": "a3fbeb63-0e8c-4a11-bff6-0e3b484c3e9c",
+      "substeps": 21
+    },
+    {
+      "trajectory_id": "b36ef2d8f2643b80e74a44ce3403f674ecb2aed7fd36afeaa289061a59feef92",
+      "substeps": 21
+    },
+    {
+      "trajectory_id": "b816bfce-3d80-4913-a07d-69b752ce6377",
+      "substeps": 24
+    },
+    {
+      "trajectory_id": "a1e91b78-d3d8-4675-bb8d-62741b4b68a6",
+      "substeps": 25
+    },
+    {
+      "trajectory_id": "840bfca7-4f7b-481a-8794-c560c340185d",
+      "substeps": 25
+    },
+    {
+      "trajectory_id": "72c06643-a2fa-4186-aa5c-9ec33ae9b445",
+      "substeps": 28
+    },
+    {
+      "trajectory_id": "6e3be83d1949fa52cba03fb1ce4b5b3bf7e37a83fd7d67694b10b2e439d90cf8",
+      "substeps": 29
+    },
+    {
+      "trajectory_id": "57d9dc6935e8a40b02e7f8ec81768fe70e68a0c05f6866927c9fda38db38a486",
+      "substeps": 31
+    },
+    {
+      "trajectory_id": "0ec4371851b96837b0a81b3dd3df401415061bb532fbafeb4609f3337c358508",
+      "substeps": 32
+    },
+    {
+      "trajectory_id": "557e78eceec08ca8b0da5f9fdaca6e1c7ec6140a8ce600983ee716327dab005e",
+      "substeps": 32
+    },
+    {
+      "trajectory_id": "114d5fd0-e2ae-4b6d-a65a-870da2d19c08",
+      "substeps": 33
+    },
+    {
+      "trajectory_id": "ccec2229ced20a4b0cb4897e3a99120a3017ea030903e01c9bda6b13d40b0b14",
+      "substeps": 37
+    },
+    {
+      "trajectory_id": "8ad84bd6fe38481ba49e7ad1f6fbd43219a999074e5c6fc940003281f55ec65b",
+      "substeps": 44
+    }
+  ]
+}
