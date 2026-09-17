@@ -315,9 +315,12 @@ IMPORTANT: Follow this schema EXACTLY. Do not add extra fields. Use correct JSON
   | ANY",
 
   "event_trigger": {
-    "step_index": "*|int|range",  // IMPORTANT: Use "*" for invariants that should be checked at EVERY step. Only use a specific int when the invariant applies to one particular step.    "substep_index": "int (optional, if not specified, invariant triggers on the whole step)",
-    "role_name": "<<AGENT_UNION>>"  // agent names derived from trajectory; "*" matches all; "*" matches all
-    },
+    "step_index": "*",  // REQUIRED: use the literal JSON string "*" (wildcard, matches every step). Static/global invariants describe policies that must hold throughout the trajectory and MUST use "*". Only use a specific int (e.g., 3) for the rare invariant that applies to one fixed step. Never use 0, 1, 2 as a stand-in for "every step" — the runtime checker treats those as concrete step indices and will silently never fire.
+    "substep_index": "*",  // use "*" unless the invariant applies to one specific substep
+    "role_name": "<<AGENT_UNION>>",  // agent names derived from trajectory; "*" matches all
+    "content_regex": "*",  // regex applied to substep.content; "*" matches all
+    "tool_name": "*"      // "*" matches all; pin to a specific tool name if the invariant targets one tool
+  },
 
   "check_hint": "deterministic procedure description in 2-8 sentences",
   "check_type": "python_check|nl_check",
@@ -338,6 +341,46 @@ IMPORTANT: Follow this schema EXACTLY. Do not add extra fields. Use correct JSON
   "nl_check": {
     ALWAYS EMPTY
   }
+}
+
+================================================================================================
+COMPLETE INVARIANT EXAMPLE (copy the event_trigger shape verbatim)
+================================================================================================
+The event_trigger.step_index value below is the literal JSON string "*". Reproduce that
+literal for every static/global invariant you emit. Do NOT replace "*" with 0, 1, or any
+other integer unless the invariant is tied to one specific step index.
+
+{
+  "assertion_name": "authenticate_before_privileged_operations",
+  "taxonomy_targets": ["Instruction/PlanAdherenceFailure"],
+  "invariant_type": "TEMPORAL",
+  "event_trigger": {
+    "step_index": "*",
+    "substep_index": "*",
+    "role_name": "assistant",
+    "content_regex": "*",
+    "tool_name": "*"
+  },
+  "check_hint": "Before any privileged tool call (e.g., get_user_details, cancel_pending_order, modify_*), verify that an earlier assistant tool call invoked one of the authentication tools (find_user_id_by_email or find_user_id_by_name_zip). If no prior auth call exists, this is a violation.",
+  "check_type": "python_check",
+  "python_check": {
+    "function_name": "authenticate_before_privileged_operations",
+    "args": ["trajectory", "current_step_index"],
+    "code_lines": [
+      "def authenticate_before_privileged_operations(trajectory, current_step_index):",
+      "    priv = {'get_user_details','get_order_details','cancel_pending_order','modify_pending_order_address','modify_pending_order_items','return_delivered_order_items','exchange_delivered_order_items','modify_user_address'}",
+      "    auth = {'find_user_id_by_email','find_user_id_by_name_zip'}",
+      "    step = trajectory['steps'][current_step_index]",
+      "    is_priv = any(ss.get('role')=='tool_call' and ss.get('tool_name') in priv for ss in step.get('substeps', []))",
+      "    if not is_priv: return True",
+      "    for prev in trajectory['steps'][:current_step_index]:",
+      "        for ss in prev.get('substeps', []):",
+      "            if ss.get('role')=='tool_call' and ss.get('tool_name') in auth:",
+      "                return True",
+      "    return False"
+    ]
+  },
+  "nl_check": {}
 }
 
 ## Quality Guidelines:
@@ -522,10 +565,12 @@ IMPORTANT: Follow this schema EXACTLY. Do not add extra fields. Use correct JSON
   | ANY",
 
   "event_trigger": {
-    "step_index": "int",
-    "substep_index": "int (optional, if not specified, invariant triggers on the whole step)",
-    "role_name": "<<AGENT_UNION>>"  // agent names derived from trajectory; "*" matches all; "*" matches all
-    },
+    "step_index": "*",  // REQUIRED: use the literal JSON string "*" (wildcard, matches every step). Static/global invariants describe policies that must hold throughout the trajectory and MUST use "*". Only use a specific int (e.g., 3) for the rare invariant that applies to one fixed step. Never use 0, 1, 2 as a stand-in for "every step" — the runtime checker treats those as concrete step indices and will silently never fire.
+    "substep_index": "*",  // use "*" unless the invariant applies to one specific substep
+    "role_name": "<<AGENT_UNION>>",  // agent names derived from trajectory; "*" matches all
+    "content_regex": "*",  // regex applied to substep.content; "*" matches all
+    "tool_name": "*"      // "*" matches all; pin to a specific tool name if the invariant targets one tool
+  },
 
   "check_hint": "deterministic procedure description in 2-8 sentences",
   "check_type": "python_check|nl_check",
@@ -551,6 +596,42 @@ IMPORTANT: Follow this schema EXACTLY. Do not add extra fields. Use correct JSON
     "judge_rubric": ["objective criterion 1", "objective criterion 2", "..."],
     "rubric_evaluation_algorithm_template": <<RUBRIC_EVALUATION_ALGORITHM>>,
     "output_format_template": <<OUTPUT_FORMAT>>
+  }
+}
+
+================================================================================================
+COMPLETE INVARIANT EXAMPLE (copy the event_trigger shape verbatim)
+================================================================================================
+The event_trigger.step_index value below is the literal JSON string "*". Reproduce that
+literal for every static/global invariant you emit. Do NOT replace "*" with 0, 1, or any
+other integer unless the invariant is tied to one specific step index.
+
+{
+  "assertion_name": "user_agent_follows_task_instruction",
+  "taxonomy_targets": ["UnderspecifiedUserIntent"],
+  "invariant_type": "TEMPORAL",
+  "event_trigger": {
+    "step_index": "*",
+    "substep_index": "*",
+    "role_name": "user",
+    "content_regex": "*",
+    "tool_name": "*"
+  },
+  "check_hint": "Verify that the simulated user agent's message is semantically consistent with the original task instruction. Check that the user is not introducing new requirements, contradicting the task instruction, or providing information that deviates from what was specified in the task.",
+  "check_type": "nl_check",
+  "python_check": {},
+  "nl_check": {
+    "judge_system_prompt_template": "You are a strict compliance judge. Evaluate only with evidence in the provided events and the task instruction. Do not infer intent beyond explicit statements. CRITICAL: If required evidence is missing or ambiguous, mark the criterion as UNCLEAR.",
+    "judge_user_prompt_template": "TASK INSTRUCTION: {TASK_INSTRUCTION}\\n\\nCURRENT USER MESSAGE: {CURRENT_EVENT_JSON}\\n\\nEvaluate whether the user agent's message is consistent with the task instruction.",
+    "judge_scope_notes": "Compare the user agent's current message against the original task instruction to detect semantic drift, contradictions, or invention of new requirements.",
+    "focus_steps_instruction": "Focus on: (1) The current user message being evaluated. (2) The original task instruction provided at the start. (3) Check for semantic alignment.",
+    "judge_rubric": [
+      "The user agent's request type matches what is specified in the task instruction",
+      "If the user mentions specific items, quantities, or attributes, they are consistent with the task instruction",
+      "The user agent does not introduce new constraints not present in the task instruction"
+    ],
+    "rubric_evaluation_algorithm_template": "{RUBRIC_EVALUATION_ALGORITHM}",
+    "output_format_template": "{OUTPUT_FORMAT}"
   }
 }
 

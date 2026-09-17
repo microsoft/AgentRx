@@ -1334,22 +1334,14 @@ def analysis(data, output_file_path=None, model_name=None, api_version=None):
     
     if output_file_path:
         try:
-            # We assume output_file_path already has the list of reports written to it 
-            # OR we rewrite it completely.
-            # In run_single_iteration we write the list first.
-            if os.path.exists(output_file_path):
-                with open(output_file_path, 'r') as f:
-                    existing_data = json.load(f)
-                # Handle either format:
-                #   - list of per-task dicts (legacy)
-                #   - {"summary": ..., "detailed_results": [...]} (current)
-                if isinstance(existing_data, dict) and "detailed_results" in existing_data:
-                    existing_data = existing_data["detailed_results"]
-                # Fallback: if format is unexpected, prefer the freshly-computed `data`
-                if not isinstance(existing_data, list):
-                    existing_data = data
-            else:
-                existing_data = data # Should match
+            # The freshly-computed `data` is the single source of truth for
+            # what goes on disk. Reading back any pre-existing
+            # ``output_file_path`` here is unsafe: an earlier AAD-interrupted
+            # write, a stale skeleton dropped by a sibling stage, or simply
+            # the previous run's detailed_results would silently overwrite the
+            # current run's results, while the summary printed below still
+            # reflects `data`. The on-disk file is an artifact, not a source.
+            existing_data = data
 
             # Calculate aggregate token and timing metrics
             total_prompt_tokens = 0
